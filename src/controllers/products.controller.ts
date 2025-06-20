@@ -1,0 +1,1093 @@
+import { Response } from 'express';
+import Database from '../database/connection';
+import SQLiteDatabase from '../database/sqlite-connection';
+import { AuthRequest } from '../middleware/auth';
+import { Product, CreateProductRequest, ApiResponse } from '../types';
+import * as XLSX from 'xlsx';
+import DatabaseConnection from '../database/connection';
+
+export class ProductsController {
+  async getProducts(req: AuthRequest, res: Response) {
+    try {
+      const { category_id, search, limit = 1000, offset = 0, is_active } = req.query;
+      
+      console.log('Get products called with params:', { category_id, search, limit, offset, is_active });
+      
+      // Build dynamic query
+      let query = `
+        SELECT p.*, c.name as category_name 
+        FROM products p 
+        LEFT JOIN categories c ON p.category_id = c.id 
+        WHERE 1=1
+      `;
+      
+      // Add search filter with word-based matching
+      if (search && typeof search === 'string' && search.trim()) {
+        const searchTerm = search.trim().replace(/'/g, "''"); // Escape single quotes
+        const searchWords = searchTerm.split(/\s+/).filter(word => word.length > 0);
+        
+        if (searchWords.length > 0) {
+          // Build search condition for each word (all words must match)
+          const searchConditions = searchWords.map(word => {
+            const escapedWord = word.replace(/'/g, "''");
+            return `(
+              p.name LIKE '%${escapedWord}%' OR 
+              p.sku LIKE '%${escapedWord}%' OR 
+              p.barcode LIKE '%${escapedWord}%' OR
+              p.description LIKE '%${escapedWord}%'
+            )`;
+          });
+          
+          query += ` AND (${searchConditions.join(' AND ')})`;
+        }
+      }
+      
+      // Add category filter
+      if (category_id && category_id !== '') {
+        query += ` AND p.category_id = ${Number(category_id)}`;
+      }
+      
+      // Add active filter
+      if (is_active !== undefined) {
+        query += ` AND p.is_active = ${is_active === 'true' ? 1 : 0}`;
+      }
+      
+      // Add ordering and pagination
+      query += ` ORDER BY p.name`;
+      
+      if (limit && limit !== 'all') {
+        query += ` LIMIT ${Number(limit)}`;
+        
+        if (offset) {
+          query += ` OFFSET ${Number(offset)}`;
+        }
+      }
+      
+      console.log('Executing query:', query);
+      
+      const db = Database.getInstance();
+      const products = await db.all(query, []);
+      
+      console.log('Query executed successfully, results:', products.length);
+
+      res.json({
+        success: true,
+        data: products
+      });
+    } catch (error) {
+      console.error('Get products error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      });
+    }
+  }
+
+  async getProduct(req: AuthRequest, res: Response) {
+    try {
+      const { id } = req.params;
+
+      const product = await Database.getInstance().get(
+        `SELECT p.*, c.name as category_name 
+         FROM products p 
+         LEFT JOIN categories c ON p.category_id = c.id 
+         WHERE p.id = ?`,
+        [id]
+      );
+
+      if (!product) {
+        return res.status(404).json({
+          success: false,
+          error: 'Product not found'
+        });
+      }
+
+      res.json({
+        success: true,
+        data: product
+      });
+    } catch (error) {
+      console.error('Get product error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      });
+    }
+  }
+
+  async createProduct(req: AuthRequest, res: Response) {
+    try {
+      const productData: CreateProductRequest = req.body;
+
+      if (!productData.name || !productData.sku || !productData.sale_price) {
+        return res.status(400).json({
+          success: false,
+          error: 'Name, SKU, and sale price are required'
+        });
+      }
+
+      // Check if SKU already exists
+      const existingProduct = await Database.getInstance().get(
+        'SELECT id FROM products WHERE sku = ?',
+        [productData.sku]
+      );
+
+      if (existingProduct) {
+        return res.status(409).json({
+          success: false,
+          error: 'SKU already exists'
+        });
+      }
+
+      const result = await Database.getInstance().run(
+        `INSERT INTO products (
+          sku, barcode, name, description, category_id, unit,
+          purchase_price, sale_price, wholesale_price, stock_quantity,
+          min_stock_level, image_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          productData.sku,
+          productData.barcode || null,
+          productData.name,
+          productData.description || null,
+          productData.category_id || null,
+          productData.unit || 'cái',
+          productData.purchase_price || 0,
+          productData.sale_price,
+          productData.wholesale_price || null,
+          productData.stock_quantity || 0,
+          productData.min_stock_level || 0,
+          productData.image_url || null
+        ]
+      );
+
+      // Create inventory transaction for initial stock
+      if (productData.stock_quantity && productData.stock_quantity > 0) {
+        await Database.getInstance().run(
+          `INSERT INTO inventory_transactions (
+            product_id, transaction_type, reference_type, quantity, 
+            unit_price, notes, user_id
+          ) VALUES (?, 'in', 'adjustment', ?, ?, 'Initial stock', ?)`,
+          [
+            result.lastID,
+            productData.stock_quantity,
+            productData.purchase_price || 0,
+            req.user?.id
+          ]
+        );
+      }
+
+      res.status(201).json({
+        success: true,
+        data: { id: result.lastID },
+        message: 'Product created successfully'
+      });
+    } catch (error) {
+      console.error('Create product error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      });
+    }
+  }
+  async updateProduct(req: AuthRequest, res: Response) {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+    
+    console.log('Updating product with ID:', id);
+    console.log('Update data:', updates);
+
+    // Dynamic query building - only update fields that are provided
+    const updateFields: string[] = [];
+    const updateValues: any[] = [];
+
+    // Define all possible updateable fields
+    const allowedFields = [
+      'sku', 'barcode', 'name', 'description', 'category_id', 'unit',
+      'purchase_price', 'sale_price', 'wholesale_price', 'promo_price',
+      'stock_quantity', 'min_stock_level', 'max_stock_level', 'expiry_date',
+      'image_url', 'has_variants', 'track_inventory', 'is_active'
+    ];
+
+    // Build dynamic update query - only include fields that have values
+    for (const field of allowedFields) {
+      if (updates[field] !== undefined && updates[field] !== null) {
+        // Special handling for empty strings - only allow for certain fields
+        if (updates[field] === '' && !['description', 'image_url', 'barcode'].includes(field)) {
+          continue; // Skip empty strings for most fields
+        }
+        updateFields.push(`${field} = ?`);
+        updateValues.push(updates[field]);
+      }
+    }
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No valid fields to update'
+      });
+    }
+
+    // Always update the updated_at timestamp
+    updateFields.push('updated_at = NOW()');
+    
+    // Add id for WHERE clause
+    updateValues.push(id);
+
+    const sql = `UPDATE products SET ${updateFields.join(', ')} WHERE id = ?`;
+    
+    console.log('SQL Query:', sql);
+    console.log('Values:', updateValues);
+
+    const result = await Database.getInstance().run(sql, updateValues);
+    
+    console.log('Update result:', result);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Product not found'
+      });
+    }
+
+    // Get updated product to return
+    const updatedProduct = await Database.getInstance().get(
+      `SELECT p.*, c.name as category_name 
+       FROM products p 
+       LEFT JOIN categories c ON p.category_id = c.id 
+       WHERE p.id = ?`,
+      [id]
+    );
+
+    res.json({
+      success: true,
+      message: 'Product updated successfully',
+      data: updatedProduct
+    });
+
+  } catch (error: any) {
+    console.error('Update product error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+}
+
+  async deleteProduct(req: AuthRequest, res: Response) {
+    try {
+      const { id } = req.params;
+
+      const result = await Database.getInstance().run(
+        'UPDATE products SET is_active = 0 WHERE id = ?',
+        [id]
+      );
+
+      if (result.affectedRows === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'Product not found'
+        });
+      }
+
+      res.json({
+        success: true,
+        message: 'Product deleted successfully'
+      });
+    } catch (error) {
+      console.error('Delete product error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      });
+    }
+  }
+
+  async getLowStockProducts(req: AuthRequest, res: Response) {
+    try {
+      const products = await Database.getInstance().all(
+        `SELECT p.*, c.name as category_name 
+         FROM products p 
+         LEFT JOIN categories c ON p.category_id = c.id 
+         WHERE p.is_active = 1 AND p.track_inventory = 1 
+         AND p.stock_quantity <= p.min_stock_level
+         ORDER BY p.stock_quantity ASC`
+      );
+
+      res.json({
+        success: true,
+        data: products
+      });
+    } catch (error) {
+      console.error('Get low stock products error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      });
+    }
+  }
+
+  async adjustStock(req: AuthRequest, res: Response) {
+    try {
+      const { id } = req.params;
+      const { quantity, notes } = req.body;
+
+      if (quantity === undefined || quantity === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Quantity is required and must not be zero'
+        });
+      }
+
+      // Get current product
+      const product = await Database.getInstance().get(
+        'SELECT * FROM products WHERE id = ?',
+        [id]
+      ) as Product;
+
+      if (!product) {
+        return res.status(404).json({
+          success: false,
+          error: 'Product not found'
+        });
+      }
+
+      const newStock = product.stock_quantity + quantity;
+
+      if (newStock < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Insufficient stock for this adjustment'
+        });
+      }
+
+      // Update stock
+      await Database.getInstance().run(
+        'UPDATE products SET stock_quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [newStock, id]
+      );
+
+      // Create inventory transaction
+      await Database.getInstance().run(
+        `INSERT INTO inventory_transactions (
+          product_id, transaction_type, reference_type, quantity, 
+          notes, user_id
+        ) VALUES (?, ?, 'adjustment', ?, ?, ?)`,
+        [
+          id,
+          quantity > 0 ? 'in' : 'out',
+          Math.abs(quantity),
+          notes || 'Stock adjustment',
+          req.user?.id
+        ]
+      );
+
+      res.json({
+        success: true,
+        message: 'Stock adjusted successfully',
+        data: { new_stock: newStock }
+      });
+    } catch (error) {
+      console.error('Adjust stock error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      });
+    }
+  }
+
+  async deleteAllProducts(req: AuthRequest, res: Response) {
+    try {
+      // Get count before deletion
+      const countResult = await Database.getInstance().get(
+        'SELECT COUNT(*) as count FROM products WHERE is_active = 1'
+      ) as { count: number };
+
+      // Soft delete all products
+      const result = await Database.getInstance().run(
+        'UPDATE products SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE is_active = 1'
+      );
+
+      res.json({
+        success: true,
+        data: { deleted_count: countResult.count },
+        message: `Successfully deleted ${countResult.count} products`
+      });
+    } catch (error) {
+      console.error('Delete all products error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      });
+    }
+  }
+
+  async bulkCreateProducts(req: AuthRequest, res: Response) {
+    try {
+      const { products } = req.body;
+
+      if (!products || !Array.isArray(products)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Products array is required'
+        });
+      }
+
+      let createdCount = 0;
+      const errors: any[] = [];
+
+      for (const productData of products) {
+        try {
+          if (!productData.name || !productData.sale_price) {
+            errors.push({
+              product: productData,
+              error: 'Name and sale price are required'
+            });
+            continue;
+          }
+
+          // Check if SKU already exists
+          const existingProduct = await Database.getInstance().get(
+            'SELECT id FROM products WHERE sku = ?',
+            [productData.sku]
+          );
+
+          if (existingProduct) {
+            errors.push({
+              product: productData,
+              error: 'SKU already exists'
+            });
+            continue;
+          }
+
+          const result = await Database.getInstance().run(
+            `INSERT INTO products (
+              sku, barcode, name, description, category_id, unit,
+              purchase_price, sale_price, wholesale_price, stock_quantity,
+              min_stock_level, image_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              productData.sku,
+              productData.barcode || null,
+              productData.name,
+              productData.description || null,
+              productData.category_id || null,
+              productData.unit || 'cái',
+              productData.purchase_price || 0,
+              productData.sale_price,
+              productData.wholesale_price || null,
+              productData.stock_quantity || 0,
+              productData.min_stock_level || 0,
+              productData.image_url || null
+            ]
+          );
+
+          // Create inventory transaction for initial stock
+          if (productData.stock_quantity && productData.stock_quantity > 0) {
+            await Database.getInstance().run(
+              `INSERT INTO inventory_transactions (
+                product_id, transaction_type, reference_type, quantity, 
+                unit_price, notes, user_id
+              ) VALUES (?, 'in', 'adjustment', ?, ?, 'Initial stock (bulk import)', ?)`,
+              [
+                result.lastID,
+                productData.stock_quantity,
+                productData.purchase_price || 0,
+                req.user?.id
+              ]
+            );
+          }
+
+          createdCount++;
+        } catch (error) {
+          errors.push({
+            product: productData,
+            error: error instanceof Error ? error.message : 'Unknown error'
+          });
+        }
+      }
+
+      res.json({
+        success: true,
+        data: {
+          created_count: createdCount,
+          errors: errors
+        },
+        message: `Bulk create completed. Created: ${createdCount}, Errors: ${errors.length}`
+      });
+    } catch (error) {
+      console.error('Bulk create products error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      });
+    }
+  }
+
+  async exportProducts(req: AuthRequest, res: Response) {
+    try {
+      console.log('Export products called - using MySQL database');
+      
+      // Use MySQL database connection
+      const db = DatabaseConnection.getInstance();
+      const products = await db.all(
+        `SELECT p.*, c.name as category_name 
+         FROM products p 
+         LEFT JOIN categories c ON p.category_id = c.id 
+         ORDER BY p.name`
+      );
+
+      console.log('Products fetched from MySQL database:', products.length);
+
+      // Prepare data for Excel export with 20 columns (same as import expects)
+      const excelData = products.map((product: any, index: number) => ({
+        'STT': index + 1,
+        'Mã SKU': product.sku || '',
+        'Mã vạch': product.barcode || '',
+        'Tên sản phẩm': product.name || '',
+        'Mô tả': product.description || '',
+        'Danh mục': product.category_name || 'Chưa phân loại',
+        'Đơn vị tính': product.unit || '',
+        'Giá vốn (VNĐ)': product.purchase_price ? Number(product.purchase_price).toLocaleString('vi-VN') : '0',
+        'Giá bán lẻ (VNĐ)': product.sale_price ? Number(product.sale_price).toLocaleString('vi-VN') : '0',
+        'Giá bán sỉ (VNĐ)': product.wholesale_price ? Number(product.wholesale_price).toLocaleString('vi-VN') : '0',
+        'Tồn kho hiện tại': product.stock_quantity || 0,
+        'Tồn kho tối thiểu': product.min_stock_level || 0,
+        'Tồn kho tối đa': product.max_stock_level || 0,
+        'Trạng thái': product.is_active ? 'Đang hoạt động' : 'Tạm dừng',
+        'URL hình ảnh': product.image_url || '',
+        'Ngày tạo': product.created_at ? new Date(product.created_at).toLocaleString('vi-VN') : '',
+        'Ngày cập nhật': product.updated_at ? new Date(product.updated_at).toLocaleString('vi-VN') : '',
+        'Lợi nhuận (VNĐ)': product.sale_price && product.purchase_price ? 
+          (Number(product.sale_price) - Number(product.purchase_price)).toLocaleString('vi-VN') : '0',
+        'Tỷ lệ lợi nhuận (%)': product.sale_price && product.purchase_price && Number(product.purchase_price) > 0 ? 
+          (((Number(product.sale_price) - Number(product.purchase_price)) / Number(product.purchase_price)) * 100).toFixed(2) + '%' : '0%',
+        'Giá trị tồn kho (VNĐ)': product.stock_quantity && product.purchase_price ? 
+          (Number(product.stock_quantity) * Number(product.purchase_price)).toLocaleString('vi-VN') : '0'
+      }));
+
+      console.log('Excel data prepared with', excelData.length, 'products and 20 columns');
+
+      // Create workbook and worksheet
+      const workbook = XLSX.utils.book_new();
+      const worksheet = XLSX.utils.json_to_sheet(excelData);
+
+      // Set column widths to match import template
+      const colWidths = [
+        { width: 8 },   // STT
+        { width: 15 },  // Mã SKU
+        { width: 18 },  // Mã vạch
+        { width: 35 },  // Tên sản phẩm
+        { width: 40 },  // Mô tả
+        { width: 20 },  // Danh mục
+        { width: 15 },  // Đơn vị tính
+        { width: 18 },  // Giá vốn
+        { width: 20 },  // Giá bán lẻ
+        { width: 18 },  // Giá bán sỉ
+        { width: 18 },  // Tồn kho hiện tại
+        { width: 18 },  // Tồn kho tối thiểu
+        { width: 18 },  // Tồn kho tối đa
+        { width: 15 },  // Trạng thái
+        { width: 25 },  // URL hình ảnh
+        { width: 20 },  // Ngày tạo
+        { width: 20 },  // Ngày cập nhật
+        { width: 18 },  // Lợi nhuận
+        { width: 20 },  // Tỷ lệ lợi nhuận
+        { width: 22 }   // Giá trị tồn kho
+      ];
+      worksheet['!cols'] = colWidths;
+
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Danh sách sản phẩm');
+
+      // Generate Excel file buffer
+      const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+
+      console.log('Excel buffer created, size:', buffer.length);
+
+      // Set response headers for file download
+      const fileName = `Danh_sach_san_pham_${new Date().toISOString().split('T')[0]}.xlsx`;
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.setHeader('Content-Length', buffer.length);
+
+      console.log('Headers set, sending file:', fileName, 'with', products.length, 'products');
+      res.send(buffer);
+    } catch (error) {
+      console.error('Export products error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      });
+    }
+  }
+
+  async testExportProducts(req: any, res: Response) {
+    try {
+      console.log('Export products called - fetching real data from database');
+      
+      // Get all real products from database with full information
+      const db = SQLiteDatabase.getInstance();
+      console.log('SQLite database instance created');
+      
+      const products = await db.all(
+        `SELECT p.*, c.name as category_name 
+         FROM products p 
+         LEFT JOIN categories c ON p.category_id = c.id 
+         WHERE p.is_active = 1
+         ORDER BY p.name`
+      );
+      
+      console.log('Query executed, raw result:', products);
+
+      console.log('Products fetched from database:', products.length);
+
+      // If no products found, get sample data from database or create sample
+      if (products.length === 0) {
+        console.log('No products found, creating sample data for export');
+        
+        // Try to get all products (including inactive ones)
+        const allProducts = await db.all(
+          `SELECT p.*, c.name as category_name 
+           FROM products p 
+           LEFT JOIN categories c ON p.category_id = c.id 
+           ORDER BY p.name`
+        );
+        
+        if (allProducts.length > 0) {
+          console.log('Found', allProducts.length, 'products (including inactive)');
+          // Use all products if available
+          const excelData = allProducts.map((product: any, index: number) => ({
+            'STT': index + 1,
+            'Mã SKU': product.sku || '',
+            'Mã vạch': product.barcode || '',
+            'Tên sản phẩm': product.name || '',
+            'Mô tả': product.description || '',
+            'Danh mục': product.category_name || 'Chưa phân loại',
+            'Đơn vị tính': product.unit || '',
+            'Giá vốn (VNĐ)': product.purchase_price ? product.purchase_price.toLocaleString('vi-VN') : '0',
+            'Giá bán lẻ (VNĐ)': product.sale_price ? product.sale_price.toLocaleString('vi-VN') : '0',
+            'Giá bán sỉ (VNĐ)': product.wholesale_price ? product.wholesale_price.toLocaleString('vi-VN') : '0',
+            'Tồn kho hiện tại': product.stock_quantity || 0,
+            'Tồn kho tối thiểu': product.min_stock_level || 0,
+            'Tồn kho tối đa': product.max_stock_level || 0,
+            'Trạng thái': product.is_active ? 'Đang hoạt động' : 'Tạm dừng',
+            'URL hình ảnh': product.image_url || '',
+            'Ngày tạo': product.created_at ? new Date(product.created_at).toLocaleString('vi-VN') : '',
+            'Ngày cập nhật': product.updated_at ? new Date(product.updated_at).toLocaleString('vi-VN') : '',
+            'Lợi nhuận (VNĐ)': product.sale_price && product.purchase_price ? 
+              (product.sale_price - product.purchase_price).toLocaleString('vi-VN') : '0',
+            'Tỷ lệ lợi nhuận (%)': product.sale_price && product.purchase_price && product.purchase_price > 0 ? 
+              (((product.sale_price - product.purchase_price) / product.purchase_price) * 100).toFixed(2) + '%' : '0%',
+            'Giá trị tồn kho (VNĐ)': product.stock_quantity && product.purchase_price ? 
+              (product.stock_quantity * product.purchase_price).toLocaleString('vi-VN') : '0'
+          }));
+          
+          // Create workbook and worksheet for all products
+          const workbook = XLSX.utils.book_new();
+          const worksheet = XLSX.utils.json_to_sheet(excelData);
+
+          // Auto-size columns
+          const range = XLSX.utils.decode_range(worksheet['!ref'] || 'A1');
+          const colWidths: any[] = [];
+          const headers = Object.keys(excelData[0]);
+          
+          for (let C = range.s.c; C <= range.e.c; ++C) {
+            let maxWidth = headers[C] ? headers[C].length : 10;
+            for (let R = range.s.r; R <= range.e.r; ++R) {
+              const cellAddress = XLSX.utils.encode_cell({ c: C, r: R });
+              const cell = worksheet[cellAddress];
+              if (cell && cell.v) {
+                const cellLength = cell.v.toString().length;
+                if (cellLength > maxWidth) {
+                  maxWidth = cellLength;
+                }
+              }
+            }
+            colWidths[C] = { width: Math.min(Math.max(maxWidth + 2, 12), 60) };
+          }
+          worksheet['!cols'] = colWidths;
+
+          XLSX.utils.book_append_sheet(workbook, worksheet, 'Tất cả sản phẩm');
+
+          const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+          const currentDate = new Date().toISOString().split('T')[0];
+          const fileName = `Tat_ca_san_pham_${currentDate}.xlsx`;
+          
+          res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+          res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+          res.setHeader('Content-Length', buffer.length);
+          res.setHeader('Cache-Control', 'no-cache');
+
+          console.log('Sending Excel file with all products:', fileName);
+          return res.send(buffer);
+        } else {
+          // Create sample data if no products at all
+          const sampleData = [{
+            'STT': 1,
+            'Mã SKU': 'SAMPLE001',
+            'Mã vạch': '1234567890123',
+            'Tên sản phẩm': 'Sản phẩm mẫu',
+            'Mô tả': 'Đây là dữ liệu mẫu để demo chức năng xuất Excel',
+            'Danh mục': 'Danh mục mẫu',
+            'Đơn vị tính': 'Cái',
+            'Giá vốn (VNĐ)': '10,000',
+            'Giá bán lẻ (VNĐ)': '15,000',
+            'Giá bán sỉ (VNĐ)': '12,000',
+            'Tồn kho hiện tại': 100,
+            'Tồn kho tối thiểu': 10,
+            'Tồn kho tối đa': 1000,
+            'Trạng thái': 'Đang hoạt động',
+            'URL hình ảnh': '',
+            'Ngày tạo': new Date().toLocaleString('vi-VN'),
+            'Ngày cập nhật': new Date().toLocaleString('vi-VN'),
+            'Lợi nhuận (VNĐ)': '5,000',
+            'Tỷ lệ lợi nhuận (%)': '50.00%',
+            'Giá trị tồn kho (VNĐ)': '1,000,000'
+          }];
+          
+          // Create workbook for sample data
+          const workbook = XLSX.utils.book_new();
+          const worksheet = XLSX.utils.json_to_sheet(sampleData);
+          XLSX.utils.book_append_sheet(workbook, worksheet, 'Dữ liệu mẫu');
+
+          const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+          const currentDate = new Date().toISOString().split('T')[0];
+          const fileName = `Du_lieu_mau_${currentDate}.xlsx`;
+          
+          res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+          res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+          res.setHeader('Content-Length', buffer.length);
+          res.setHeader('Cache-Control', 'no-cache');
+
+          console.log('Sending sample Excel file:', fileName);
+          return res.send(buffer);
+        }
+      }
+
+      // Prepare complete data for Excel export with all columns
+      const excelData = products.map((product: any) => ({
+        'STT': products.indexOf(product) + 1,
+        'Mã SKU': product.sku || '',
+        'Mã vạch': product.barcode || '',
+        'Tên sản phẩm': product.name || '',
+        'Mô tả': product.description || '',
+        'Danh mục': product.category_name || 'Chưa phân loại',
+        'Đơn vị tính': product.unit || '',
+        'Giá vốn (VNĐ)': product.purchase_price ? product.purchase_price.toLocaleString('vi-VN') : '0',
+        'Giá bán lẻ (VNĐ)': product.sale_price ? product.sale_price.toLocaleString('vi-VN') : '0',
+        'Giá bán sỉ (VNĐ)': product.wholesale_price ? product.wholesale_price.toLocaleString('vi-VN') : '0',
+        'Tồn kho hiện tại': product.stock_quantity || 0,
+        'Tồn kho tối thiểu': product.min_stock_level || 0,
+        'Tồn kho tối đa': product.max_stock_level || 0,
+        'Trạng thái': product.is_active ? 'Đang hoạt động' : 'Tạm dừng',
+        'URL hình ảnh': product.image_url || '',
+        'Ngày tạo': product.created_at ? new Date(product.created_at).toLocaleString('vi-VN') : '',
+        'Ngày cập nhật': product.updated_at ? new Date(product.updated_at).toLocaleString('vi-VN') : '',
+        'Lợi nhuận (VNĐ)': product.sale_price && product.purchase_price ? 
+          (product.sale_price - product.purchase_price).toLocaleString('vi-VN') : '0',
+        'Tỷ lệ lợi nhuận (%)': product.sale_price && product.purchase_price && product.purchase_price > 0 ? 
+          (((product.sale_price - product.purchase_price) / product.purchase_price) * 100).toFixed(2) + '%' : '0%',
+        'Giá trị tồn kho (VNĐ)': product.stock_quantity && product.purchase_price ? 
+          (product.stock_quantity * product.purchase_price).toLocaleString('vi-VN') : '0'
+      }));
+
+      console.log('Excel data prepared with', excelData.length, 'products and', Object.keys(excelData[0]).length, 'columns');
+
+      // Create workbook and worksheet
+      const workbook = XLSX.utils.book_new();
+      const worksheet = XLSX.utils.json_to_sheet(excelData);
+
+      // Auto-size columns with better width calculation
+      const range = XLSX.utils.decode_range(worksheet['!ref'] || 'A1');
+      const colWidths: any[] = [];
+      
+      // Get column headers for better width calculation
+      const headers = Object.keys(excelData[0]);
+      
+      for (let C = range.s.c; C <= range.e.c; ++C) {
+        let maxWidth = headers[C] ? headers[C].length : 10;
+        
+        for (let R = range.s.r; R <= range.e.r; ++R) {
+          const cellAddress = XLSX.utils.encode_cell({ c: C, r: R });
+          const cell = worksheet[cellAddress];
+          if (cell && cell.v) {
+            const cellLength = cell.v.toString().length;
+            if (cellLength > maxWidth) {
+              maxWidth = cellLength;
+            }
+          }
+        }
+        
+        // Set reasonable column width limits
+        colWidths[C] = { width: Math.min(Math.max(maxWidth + 2, 12), 60) };
+      }
+      worksheet['!cols'] = colWidths;
+
+      // Add worksheet to workbook with Vietnamese name
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Danh sách sản phẩm');
+
+      // Generate Excel file buffer
+      const buffer = XLSX.write(workbook, {
+        type: 'buffer',
+        bookType: 'xlsx'
+      });
+
+      console.log('Excel buffer created successfully, size:', buffer.length, 'bytes');
+
+      // Set response headers for file download
+      const currentDate = new Date().toISOString().split('T')[0];
+      const fileName = `Danh_sach_san_pham_${currentDate}.xlsx`;
+      
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.setHeader('Content-Length', buffer.length);
+      res.setHeader('Cache-Control', 'no-cache');
+
+      console.log('Sending Excel file:', fileName);
+      res.send(buffer);
+      
+    } catch (error) {
+      console.error('Export products error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to export products',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      });
+    }
+  }
+
+  async importProducts(req: any, res: Response) {
+    try {
+      console.log('Import products called');
+      
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          error: 'No file uploaded'
+        });
+      }
+
+      console.log('File received:', req.file.originalname, 'Size:', req.file.size);
+
+      // Read Excel file from buffer
+      const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+      const sheetName = workbook.SheetNames[0];
+      const worksheet = workbook.Sheets[sheetName];
+      
+      // Convert to JSON
+      const jsonData = XLSX.utils.sheet_to_json(worksheet);
+      console.log('Excel data parsed, rows:', jsonData.length);
+
+      if (jsonData.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'File Excel không có dữ liệu'
+        });
+      }
+
+      const db = Database.getInstance();
+      let successCount = 0;
+      let errorCount = 0;
+      const errors: any[] = [];
+
+      // Process each row
+      for (let i = 0; i < jsonData.length; i++) {
+        const row: any = jsonData[i];
+        
+        try {
+          // Skip empty rows
+          const hasData = Object.values(row).some(value => 
+            value !== null && value !== undefined && String(value).trim() !== ''
+          );
+          
+          if (!hasData) {
+            console.log(`Skipping empty row ${i + 1}`);
+            continue;
+          }
+
+          // Get category ID by name
+          const categoryName = row['Danh mục'] || row['Category'] || row['category'] || '';
+          let categoryId = 1; // Default to first category
+          
+          if (categoryName) {
+            const categoryResult = await db.get(
+              'SELECT id FROM categories WHERE name = ? OR name LIKE ?',
+              [categoryName, `%${categoryName}%`]
+            );
+            if (categoryResult) {
+              categoryId = categoryResult.id;
+            }
+          }
+
+          // Map Excel columns to database fields - matching the actual file structure
+          const productData = {
+            sku: row['Mã hàng'] || row['Mã SKU'] || row['SKU'] || row['sku'] || `AUTO_${Date.now()}_${i}`,
+            barcode: row['Mã vạch'] || row['Barcode'] || row['barcode'] || '',
+            name: row['Tên hàng'] || row['Tên sản phẩm'] || row['Product Name'] || row['name'] || '',
+            description: row['Mô tả'] || row['Description'] || row['description'] || '',
+            unit: row['Đơn vị tính'] || row['Unit'] || row['unit'] || 'Cái',
+            purchase_price: this.parsePrice(row['Giá vốn'] || row['Giá vốn (VNĐ)'] || row['Purchase Price'] || row['purchase_price'] || 0),
+            sale_price: this.parsePrice(row['Giá bán'] || row['Giá bán lẻ (VNĐ)'] || row['Sale Price'] || row['sale_price'] || 0),
+            wholesale_price: this.parsePrice(row['Giá bán sỉ'] || row['Giá bán sỉ (VNĐ)'] || row['Wholesale Price'] || row['wholesale_price'] || 0),
+            stock_quantity: parseInt(row['Tồn kho'] || row['Tồn kho hiện tại'] || row['Stock'] || row['stock_quantity'] || '0'),
+            min_stock_level: parseInt(row['Tồn kho tối thiểu'] || row['Min Stock'] || row['min_stock_level'] || '5'),
+            max_stock_level: parseInt(row['Tồn kho tối đa'] || row['Max Stock'] || row['max_stock_level'] || '1000'),
+            category_id: categoryId,
+            is_active: (row['Trạng thái'] === 'Tạm dừng' || row['Status'] === 'Inactive') ? 0 : 1,
+            image_url: row['URL hình ảnh'] || row['Image URL'] || row['image_url'] || null
+          };
+
+          // Debug log for first few rows
+          if (i < 5) {
+            console.log(`Row ${i + 1} data:`, JSON.stringify(productData, null, 2));
+          }
+
+          // Validate required fields
+          if (!productData.name || !productData.sale_price) {
+            errors.push({
+              row: i + 1,
+              error: `Thiếu tên sản phẩm hoặc giá bán. Name: '${productData.name}', Sale price: '${productData.sale_price}'`,
+              data: row
+            });
+            errorCount++;
+            continue;
+          }
+
+          // Check if product exists by SKU
+          const existingProduct = await db.get(
+            'SELECT id FROM products WHERE sku = ?',
+            [productData.sku]
+          );
+
+          if (existingProduct) {
+            // Update existing product
+            await db.run(
+              `UPDATE products SET 
+               name = ?, description = ?, unit = ?, purchase_price = ?, 
+               sale_price = ?, wholesale_price = ?, stock_quantity = ?, 
+               min_stock_level = ?, max_stock_level = ?, is_active = ?, 
+               image_url = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE sku = ?`,
+              [
+                productData.name, productData.description, productData.unit,
+                productData.purchase_price, productData.sale_price, productData.wholesale_price,
+                productData.stock_quantity, productData.min_stock_level, productData.max_stock_level,
+                productData.is_active, productData.image_url, productData.sku
+              ]
+            );
+            console.log(`Updated product: ${productData.name}`);
+          } else {
+            // Insert new product
+            await db.run(
+              `INSERT INTO products (
+                sku, barcode, name, description, category_id, unit,
+                purchase_price, sale_price, wholesale_price, stock_quantity,
+                min_stock_level, max_stock_level, is_active, image_url
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                productData.sku, productData.barcode, productData.name, productData.description,
+                productData.category_id, productData.unit, productData.purchase_price,
+                productData.sale_price, productData.wholesale_price, productData.stock_quantity,
+                productData.min_stock_level, productData.max_stock_level, productData.is_active,
+                productData.image_url
+              ]
+            );
+            console.log(`Inserted new product: ${productData.name}`);
+          }
+
+          successCount++;
+        } catch (error) {
+          console.error(`Error processing row ${i + 1}:`, error);
+          errors.push({
+            row: i + 1,
+            error: error instanceof Error ? error.message : 'Unknown error',
+            data: row
+          });
+          errorCount++;
+        }
+      }
+
+      console.log(`Import completed. Success: ${successCount}, Errors: ${errorCount}`);
+
+      res.json({
+        success: true,
+        data: {
+          total_rows: jsonData.length,
+          success_count: successCount,
+          error_count: errorCount,
+          errors: errors.slice(0, 10) // Limit error details to first 10
+        },
+        message: `Nhập thành công ${successCount} sản phẩm. Lỗi: ${errorCount}`
+      });
+
+    } catch (error) {
+      console.error('Import products error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Lỗi khi nhập file Excel',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      });
+    }
+  }
+
+  private parsePrice(value: any): number {
+    if (typeof value === 'number') return value;
+    if (typeof value === 'string') {
+      // Remove commas, currency symbols, and parse
+      const cleaned = value.replace(/[,\s₫VNĐ]/g, '');
+      const parsed = parseFloat(cleaned);
+      return isNaN(parsed) ? 0 : parsed;
+    }
+    return 0;
+  }
+
+  async getDashboardStats(req: AuthRequest, res: Response) {
+    try {
+      const db = Database.getInstance();
+      
+      // Get total products count
+      const totalProductsResult = await db.get(
+        'SELECT COUNT(*) as total FROM products'
+      );
+      const totalProducts = totalProductsResult?.total || 0;
+      
+      // Get out of stock count
+      const outOfStockResult = await db.get(
+        'SELECT COUNT(*) as count FROM products WHERE stock_quantity <= 0'
+      );
+      const outOfStock = outOfStockResult?.count || 0;
+      
+      // Get low stock count (stock <= min_stock_level and stock > 0)
+      const lowStockResult = await db.get(
+        'SELECT COUNT(*) as count FROM products WHERE stock_quantity > 0 AND stock_quantity <= min_stock_level'
+      );
+      const lowStock = lowStockResult?.count || 0;
+      
+      // Get total inventory value (stock_quantity * purchase_price)
+      const totalValueResult = await db.get(
+        'SELECT SUM(stock_quantity * purchase_price) as total_value FROM products WHERE stock_quantity > 0 AND purchase_price > 0'
+      );
+      const totalValue = totalValueResult?.total_value || 0;
+
+      res.json({
+        success: true,
+        data: {
+          total_products: totalProducts,
+          out_of_stock: outOfStock,
+          low_stock: lowStock,
+          total_inventory_value: Number(totalValue)
+        }
+      });
+    } catch (error) {
+      console.error('Get dashboard stats error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      });
+    }
+  }
+} 
