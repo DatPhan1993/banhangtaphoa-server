@@ -1,0 +1,20 @@
+# Environment Variables cần set cho Backend trên Vercel Dashboard
+# Vào: https://vercel.com/dashboard → aabanhangtaphoa → Settings → Environment Variables
+
+NODE_ENV=production
+
+# Database (PlanetScale) - Bạn sẽ có sau khi setup PlanetScale
+DB_HOST=your-planetscale-host.psdb.cloud
+DB_USER=your-planetscale-username
+DB_PASSWORD=your-planetscale-password
+DB_NAME=pos-system
+DB_PORT=3306
+
+# JWT Secret (tạo một secret key mạnh)
+JWT_SECRET=your-super-secret-jwt-key-at-least-32-characters-long
+
+# CORS (sẽ update sau khi deploy frontend)
+CORS_ORIGIN=https://ththuyhuong.food
+
+# Optional: Database URL format (nếu dùng DATABASE_URL thay vì riêng lẻ)
+# DATABASE_URL=mysql://username:password@host:port/database 
